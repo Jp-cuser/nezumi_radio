@@ -1,0 +1,36 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    # Audiusプラグインの追加 (v4用)
+    - dependency: "com.github.bednie:audius-plugin:main-SNAPSHOT"
+      repository: "https://jitpack.io"
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: false
+      bandcamp: false
+      soundcloud: false
+      twitch: false
+      vimeo: false
+      http: true # AudiusはHTTP/API経由で動作するため有効にする
+      local: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: false # Audius特化のためオフを推奨
+    soundcloudSearchEnabled: false
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO
