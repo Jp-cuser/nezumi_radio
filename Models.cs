@@ -38,6 +38,9 @@ namespace NezumiRadio
         public bool IsPreloading { get; set; }
         public int CurrentTrackIndex { get; set; }
         public DateTime TrackStartTime { get; set; }
+        public TimeSpan LastPosition { get; set; } = TimeSpan.Zero;
+        public int StuckCounter { get; set; }
+        public bool IsResuming { get; set; }
         public SemaphoreSlim Lock { get; } = new(1, 1);
         
         public void Dispose() 

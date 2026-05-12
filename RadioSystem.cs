@@ -5,6 +5,9 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
+using System.Net.Http;
+using System.Reflection;
 using Discord;
 using Discord.WebSocket;
 using Discord.Interactions;
@@ -34,6 +37,12 @@ namespace NezumiRadio
         public const ulong ProductionGuildId = 1450709451488100396;
         public const ulong TestGuildId = 1483795902610145463;
 
+        private readonly ulong[] _targetCategoryIds = { 1450712250514935960, 1483795904183140373 };
+        private readonly Dictionary<ulong, ulong> _lastControllerMessageIds = new();
+
+        private bool _isEmergencyStopping = false;
+        private const float DefaultVolume = 0.14f;
+
         public RadioSystem(IServiceProvider services, AudiusApiService audius, ILogger<RadioSystem> logger)
         {
             _services = services; _audius = audius; _logger = logger;
@@ -51,7 +60,15 @@ namespace NezumiRadio
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             SystemState? initialState = null;
-            if (File.Exists(StateFile)) { try { initialState = JsonSerializer.Deserialize<SystemState>(File.ReadAllText(StateFile)); } catch { } }
+            if (File.Exists(StateFile)) { 
+                try { 
+                    initialState = JsonSerializer.Deserialize<SystemState>(File.ReadAllText(StateFile)); 
+                    _logger.LogInformation("Loaded existing system state.");
+                } catch { } 
+            }
+
+            _logger.LogInformation("System starting: Checking Lavalink status...");
+            await WaitForLavalinkReadyAsync(stoppingToken);
 
             for (int i = 0; i < 6; i++)
             {
@@ -61,7 +78,7 @@ namespace NezumiRadio
                 await Task.Delay(1000);
 
                 var client = new DiscordSocketClient(new DiscordSocketConfig { 
-                    GatewayIntents = GatewayIntents.AllUnprivileged | GatewayIntents.GuildVoiceStates | GatewayIntents.Guilds,
+                    GatewayIntents = GatewayIntents.AllUnprivileged | GatewayIntents.GuildVoiceStates | GatewayIntents.Guilds | GatewayIntents.GuildMessages | GatewayIntents.MessageContent,
                     AlwaysDownloadUsers = true
                 });
 
@@ -86,12 +103,29 @@ namespace NezumiRadio
                 
                 Units.Add(unit);
 
+                if (i == 0) {
+                    client.MessageReceived += async (msg) => await HandleStickyControllerAsync(client, msg);
+                    client.UserVoiceStateUpdated += async (u, oldState, newState) => {
+                        if (oldState.VoiceChannel == null && newState.VoiceChannel != null && !u.IsBot) {
+                            var categoryChannels = newState.VoiceChannel.Guild.TextChannels.Where(c => _targetCategoryIds.Contains(c.CategoryId ?? 0));
+                            foreach (var ch in categoryChannels) {
+                                await TriggerStickyRefreshAsync(client, ch);
+                            }
+                        }
+                    };
+                }
+
+                client.ButtonExecuted += async (btn) => await HandleControllerButtonsAsync(btn);
+
                 audio.TrackStarted += async (s, e) => {
                     if (e.Player.GuildId == ProductionGuildId || e.Player.GuildId == TestGuildId) {
                         unit.TrackStartTime = DateTime.Now;
                         unit.CurrentTrackTitle = e.Track.Title;
+                        unit.LastPosition = TimeSpan.Zero;
+                        unit.StuckCounter = 0;
                         await unit.Client.SetGameAsync(unit.CurrentTrackTitle, null, ActivityType.Listening);
                         await HandleTrackStarted(unit, e);
+                        await UpdateAllControllersAsync();
                     }
                 };
                 
@@ -99,12 +133,13 @@ namespace NezumiRadio
                     if (e.Player.GuildId == ProductionGuildId || e.Player.GuildId == TestGuildId) {
                         if (e.Reason.ToString().Contains("Finished", StringComparison.OrdinalIgnoreCase) || e.Reason.ToString().Contains("Replaced", StringComparison.OrdinalIgnoreCase)) {
                             await HandleTrackEnded(unit, stoppingToken);
+                            await UpdateAllControllersAsync();
                         }
                     }
                 };
 
-                audio.TrackException += async (s, e) => { await HandleTrackEnded(unit, stoppingToken); };
-                audio.TrackStuck += async (s, e) => { await HandleTrackEnded(unit, stoppingToken); };
+                audio.TrackException += async (s, e) => { await HandleTrackEnded(unit, stoppingToken); await UpdateAllControllersAsync(); };
+                audio.TrackStuck += async (s, e) => { await HandleTrackEnded(unit, stoppingToken); await UpdateAllControllersAsync(); };
 
                 client.Ready += async () => {
                     _ = Task.Run(async () => {
@@ -131,14 +166,200 @@ namespace NezumiRadio
             while (!stoppingToken.IsCancellationRequested) { SaveGlobalState(); await Task.Delay(10000, stoppingToken); }
         }
 
+        #region Sticky Controller Logic
+
+        private async Task HandleStickyControllerAsync(DiscordSocketClient client, SocketMessage msg)
+        {
+            if (msg.Author.IsBot) return;
+            var channel = msg.Channel as SocketTextChannel;
+            if (channel == null || !_targetCategoryIds.Contains(channel.CategoryId ?? 0)) return;
+
+            await TriggerStickyRefreshAsync(client, channel);
+        }
+
+        private async Task TriggerStickyRefreshAsync(DiscordSocketClient client, SocketTextChannel channel)
+        {
+            if (_lastControllerMessageIds.TryGetValue(channel.Id, out ulong lastId)) {
+                try { var oldMsg = await channel.GetMessageAsync(lastId); if (oldMsg != null) await oldMsg.DeleteAsync(); } catch { }
+            }
+
+            var (embed, components) = BuildController(channel.Guild.Id);
+            var newMsg = await channel.SendMessageAsync(embed: embed, components: components);
+            _lastControllerMessageIds[channel.Id] = newMsg.Id;
+        }
+
+        private (Embed, MessageComponent) BuildController(ulong guildId)
+        {
+            var embed = new EmbedBuilder()
+                .WithTitle("📻 NEZUMI RADIO 放送管理パネル")
+                .WithDescription("ボタンを押すとボットがVCに来ます。")
+                .WithColor(Color.Blue);
+
+            for (int i = 0; i < 3; i++) {
+                var u1 = Units.FirstOrDefault(u => u.Index == i * 2);
+                var u2 = Units.FirstOrDefault(u => u.Index == (i * 2) + 1);
+
+                string s1 = GetUnitStatusEmoji(u1, guildId);
+                string s2 = GetUnitStatusEmoji(u2, guildId);
+                
+                embed.AddField($"{GetGroupLabel(i)} ステーション", 
+                    $"{s1} A機 {s2} B機");
+            }
+
+            embed.AddField("状態の説明", 
+                "🟢：このサーバーで放送中\n" +
+                "🟡：他のサーバーで放送中（呼べません）\n" +
+                "⚪：待機中（呼ぶことができます）");
+
+            var builder = new ComponentBuilder();
+            builder.WithButton("Dance & High Energy", "ctrl_0", ButtonStyle.Success, row: 0);
+            builder.WithButton("Urban & Groove", "ctrl_1", ButtonStyle.Success, row: 0);
+            builder.WithButton("Chill & Relax", "ctrl_2", ButtonStyle.Success, row: 0);
+            builder.WithButton("退出", "ctrl_leave", ButtonStyle.Danger, row: 1);
+
+            return (embed.Build(), builder.Build());
+        }
+
+        private string GetUnitStatusEmoji(BotUnit? unit, ulong guildId) {
+            if (unit == null || !unit.IsActive || unit.TargetVoiceChannelId == 0) return "⚪";
+            
+            // プレイヤー情報を取得
+            var player = GetPlayerAsync(unit).GetAwaiter().GetResult();
+            
+            // テストサーバーにいる場合は、どこから見ても⚪（呼べる状態）にする
+            if (player != null && player.GuildId == TestGuildId) return "⚪";
+
+            // それ以外の場所で、現在のパネルを表示しているサーバーにいる場合のみ🟢
+            if (unit.Client.GetGuild(guildId)?.GetVoiceChannel(unit.TargetVoiceChannelId) != null) return "🟢";
+            
+            // 他の本番サーバーにいる場合は🟡
+            return "🟡";
+        }
+
+        private string GetGroupLabel(int group) => group switch { 
+            0 => "Dance & High Energy", 
+            1 => "Urban & Groove", 
+            2 => "Chill & Relax", 
+            _ => "Other" 
+        };
+
+        private async Task UpdateAllControllersAsync()
+        {
+            foreach (var kvp in _lastControllerMessageIds) {
+                try {
+                    var unit = Units.FirstOrDefault();
+                    if (unit == null) continue;
+                    var channel = unit.Client.GetChannel(kvp.Key) as SocketTextChannel;
+                    if (channel != null) {
+                        var (embed, components) = BuildController(channel.Guild.Id);
+                        var msg = await channel.GetMessageAsync(kvp.Value) as IUserMessage;
+                        if (msg != null) await msg.ModifyAsync(x => { x.Embed = embed; x.Components = components; });
+                    }
+                } catch { }
+            }
+        }
+
+        private async Task HandleControllerButtonsAsync(SocketMessageComponent btn)
+        {
+            var user = btn.User as IGuildUser;
+            var vcId = user?.VoiceChannel?.Id ?? 0;
+            if (vcId == 0) { await btn.RespondAsync("先にボイスチャンネルに入ってください！", ephemeral: true); return; }
+
+            if (btn.Data.CustomId == "ctrl_leave") {
+                var botsInVC = Units.Where(u => u.IsActive && u.TargetVoiceChannelId == vcId).ToList();
+                if (botsInVC.Count == 0) { await btn.RespondAsync("このVCにボットはいません。", ephemeral: true); return; }
+
+                foreach (var b in botsInVC) {
+                    b.IsActive = false;
+                    b.TargetVoiceChannelId = 0;
+                }
+                await btn.RespondAsync("すべてのボットを退出させました。", ephemeral: true);
+            }
+            else if (btn.Data.CustomId.StartsWith("ctrl_")) {
+                int stationIndex = int.Parse(btn.Data.CustomId.Split('_')[1]);
+                var groupUnits = Units.Where(u => u.Index / 2 == stationIndex).ToList();
+
+                var activeInThisVC = groupUnits.FirstOrDefault(u => u.IsActive && u.TargetVoiceChannelId == vcId);
+                if (activeInThisVC != null) {
+                    activeInThisVC.IsActive = false;
+                    activeInThisVC.TargetVoiceChannelId = 0;
+                    await btn.RespondAsync($"{GetGroupLabel(stationIndex)} ステーションを退出させました。", ephemeral: true);
+                } else {
+                    var otherBotInThisVC = Units.FirstOrDefault(u => u.IsActive && u.TargetVoiceChannelId == vcId);
+                    if (otherBotInThisVC != null) {
+                        otherBotInThisVC.IsActive = false;
+                        otherBotInThisVC.TargetVoiceChannelId = 0;
+                    }
+
+                    var availableUnit = groupUnits.FirstOrDefault(u => {
+                        if (!u.IsActive || u.TargetVoiceChannelId == 0) return true;
+                        var p = GetPlayerAsync(u).GetAwaiter().GetResult();
+                        return p != null && p.GuildId == TestGuildId;
+                    });
+
+                    if (availableUnit != null) {
+                        var player = await GetPlayerAsync(availableUnit);
+                        if (player != null && player.VoiceChannelId != 0 && player.GuildId != TestGuildId && player.GuildId != btn.GuildId) {
+                            availableUnit = groupUnits.LastOrDefault(u => {
+                                if (!u.IsActive || u.TargetVoiceChannelId == 0) return true;
+                                var p = GetPlayerAsync(u).GetAwaiter().GetResult();
+                                return p != null && p.GuildId == TestGuildId;
+                            });
+                            player = await GetPlayerAsync(availableUnit!);
+                            if (player != null && player.VoiceChannelId != 0 && player.GuildId != TestGuildId && player.GuildId != btn.GuildId) {
+                                await btn.RespondAsync($"⚠️ 他の本番サーバーで稼働中のため呼べません。", ephemeral: true);
+                                return;
+                            }
+                        }
+
+                        availableUnit!.IsActive = true;
+                        availableUnit.TargetVoiceChannelId = vcId;
+                        await btn.RespondAsync($"{GetGroupLabel(stationIndex)} ステーションを呼びました。", ephemeral: true);
+                    }
+                }
+            }
+            await UpdateAllControllersAsync();
+        }
+
+        #endregion
+
+        private async Task<bool> IsLavalinkReadyAsync(CancellationToken ct)
+        {
+            var url = (Environment.GetEnvironmentVariable("LAVALINK_URL") ?? "http://localhost:2333").TrimEnd('/') + "/version";
+            var password = Environment.GetEnvironmentVariable("LAVALINK_PASSWORD") ?? "youshallnotpass";
+            
+            using var http = new HttpClient();
+            http.DefaultRequestHeaders.Add("Authorization", password);
+            try {
+                var res = await http.GetAsync(url, ct);
+                return res.IsSuccessStatusCode;
+            } catch { return false; }
+        }
+
+        private async Task WaitForLavalinkReadyAsync(CancellationToken ct)
+        {
+            for (int i = 0; i < 60; i++) {
+                if (await IsLavalinkReadyAsync(ct)) { _logger.LogInformation("Lavalink is ready!"); return; }
+                _logger.LogInformation($"Waiting for Lavalink... ({i+1}/60)");
+                await Task.Delay(1000, ct);
+            }
+            _logger.LogWarning("Lavalink wait timed out. Proceeding anyway.");
+        }
+
         private async Task ApplyNormalizerFilters(LavalinkPlayer player)
         {
-            await ((dynamic)player).SetVolumeAsync(0.14f);
+            try {
+                var method = player.GetType().GetMethod("SetVolumeAsync", BindingFlags.Instance | BindingFlags.Public | BindingFlags.FlattenHierarchy);
+                if (method != null) {
+                    var result = method.Invoke(player, new object[] { DefaultVolume, null! });
+                    if (result is ValueTask vt) await vt;
+                }
+            } catch { }
         }
 
         private async Task HandleTrackEnded(BotUnit unit, CancellationToken ct)
         {
-            if (!unit.IsActive) return;
+            if (!unit.IsActive || _isEmergencyStopping) return;
             await unit.Lock.WaitAsync(ct);
             try {
                 if (unit.VirtualQueue.Count > 0) unit.VirtualQueue.RemoveAt(0);
@@ -146,6 +367,7 @@ namespace NezumiRadio
                 if (unit.VirtualQueue.Count > 0) {
                     var player = await GetPlayerAsync(unit);
                     if (player != null && player.VoiceChannelId == unit.TargetVoiceChannelId) {
+                        await ApplyNormalizerFilters(player);
                         await player.PlayAsync(unit.VirtualQueue[0]);
                     }
                 }
@@ -155,7 +377,12 @@ namespace NezumiRadio
         private async Task RunUnitLoopAsync(BotUnit unit, CancellationToken ct)
         {
             while (!ct.IsCancellationRequested) {
-                try { await TickUnitAsync(unit, ct); } catch (Exception ex) { Console.WriteLine($"[Unit {unit.Index+1:D2}] Tick Error: {ex.Message}"); }
+                try {
+                    while (_isEmergencyStopping && !ct.IsCancellationRequested) { await Task.Delay(500, ct); }
+                    await TickUnitAsync(unit, ct); 
+                } catch (Exception ex) { 
+                    _logger.LogError($"[Unit {unit.Index+1:D2}] Tick Error: {ex.Message}"); 
+                }
                 await Task.Delay(5000, ct);
             }
         }
@@ -195,33 +422,118 @@ namespace NezumiRadio
                 
                 bool isGenreMismatched = string.IsNullOrEmpty(unit.LastGenre) || unit.LastGenre != targetGenre;
                 
-                await PrepareTracksOnDemandAsync(unit, targetGenre, ct);
-                await HandlePhysicalConnectionAsync(unit, ct);
+                if (isGenreMismatched && !string.IsNullOrEmpty(unit.LastGenre) && unit.Index == 0 && !_isEmergencyStopping) {
+                    await StopAllPlaybackAsync();
+                }
+
+                while (_isEmergencyStopping && !ct.IsCancellationRequested) { await Task.Delay(500, ct); }
+
+                bool jingleReady = await PrepareTracksOnDemandAsync(unit, targetGenre, ct);
+                bool justJoined = await HandlePhysicalConnectionAsync(unit, ct);
+                
+                if (justJoined) {
+                    _logger.LogInformation($"[Unit {unit.Index+1:D2}] Just joined VC. Stabilizing for 2s...");
+                    await Task.Delay(2000, ct);
+                }
 
                 if (unit.VirtualQueue.Count > 0) {
                     var player = await GetPlayerAsync(unit);
                     var current = unit.VirtualQueue[0];
-                    bool isPlaying = player != null && player.State.ToString().Contains("Playing", StringComparison.OrdinalIgnoreCase);
+                    
+                    string stateStr = player?.State.ToString() ?? "None";
+                    bool isActuallyPlaying = stateStr.Contains("Playing", StringComparison.OrdinalIgnoreCase);
+                    bool isBuffering = stateStr.Contains("Buffering", StringComparison.OrdinalIgnoreCase);
 
                     if (unit.IsActive && player != null && player.VoiceChannelId == unit.TargetVoiceChannelId) {
-                        if (isGenreMismatched) {
+                        bool isCurrentJingle = current.Title.Contains("jingle", StringComparison.OrdinalIgnoreCase) || current.Title.Contains("Unknown", StringComparison.OrdinalIgnoreCase);
+                        
+                        if (isGenreMismatched && !isCurrentJingle) {
+                            _logger.LogWarning($"[Unit {unit.Index+1:D2}] Queue sync error: First track is not jingle. Retrying...");
+                            unit.VirtualQueue.Clear();
+                            return;
+                        }
+
+                        if (isGenreMismatched && !jingleReady) {
+                            _logger.LogWarning($"[Unit {unit.Index+1:D2}] Waiting for jingle to be ready...");
+                            return; 
+                        }
+
+                        if (isActuallyPlaying && !isGenreMismatched) {
+                            TimeSpan currentPos = TimeSpan.Zero;
+                            try {
+                                var posProp = player.GetType().GetProperty("Position");
+                                if (posProp != null) {
+                                    var trackPos = posProp.GetValue(player);
+                                    if (trackPos != null) {
+                                        var valueProp = trackPos.GetType().GetProperty("Value");
+                                        if (valueProp != null) {
+                                            var val = valueProp.GetValue(trackPos);
+                                            if (val is TimeSpan ts) currentPos = ts;
+                                        }
+                                    }
+                                }
+                            } catch { }
+
+                            if (currentPos == unit.LastPosition && currentPos != TimeSpan.Zero) {
+                                unit.StuckCounter++;
+                                if (unit.StuckCounter >= 3) {
+                                    _logger.LogWarning($"[Unit {unit.Index+1:D2}] Track stuck detected, skipping...");
+                                    unit.VirtualQueue.RemoveAt(0);
+                                    await FillVirtualQueueAsync(unit, ct);
+                                    await ApplyNormalizerFilters(player);
+                                    await player.PlayAsync(unit.VirtualQueue[0]);
+                                    unit.StuckCounter = 0;
+                                    return;
+                                }
+                            } else {
+                                unit.LastPosition = currentPos;
+                                unit.StuckCounter = 0;
+                            }
+                        }
+
+                        if (DateTime.Now.Minute == 59) {
+                            float progress = DateTime.Now.Second / 60.0f;
+                            float fadeVolume = DefaultVolume * (1.0f - progress);
+                            try {
+                                var method = player.GetType().GetMethod("SetVolumeAsync", BindingFlags.Instance | BindingFlags.Public | BindingFlags.FlattenHierarchy);
+                                if (method != null) {
+                                    var result = method.Invoke(player, new object[] { fadeVolume, null! });
+                                    if (result is ValueTask vt) await vt;
+                                }
+                            } catch { }
+                        }
+
+                        if (isGenreMismatched && jingleReady) {
+                            _logger.LogInformation($"[Unit {unit.Index+1:D2}] Switching to {targetGenre} - Playing Jingle: {current.Title}");
                             unit.TrackStartTime = DateTime.Now;
-                            // PlayAsync はデフォルトで前の曲を中断（replace）するが、確実に実行
+                            await player.StopAsync();
+                            await ApplyNormalizerFilters(player);
                             await player.PlayAsync(current);
                             unit.LastGenre = targetGenre;
+                            await unit.Client.SetGameAsync(current.Title, null, ActivityType.Listening);
+                            unit.IsResuming = false;
                         }
-                        else if (!isPlaying) {
+                        else if (!isActuallyPlaying && !isBuffering) {
                             var duration = current.Duration == TimeSpan.Zero ? TimeSpan.FromMinutes(3) : current.Duration;
                             if (DateTime.Now > unit.TrackStartTime + duration) {
+                                _logger.LogInformation($"[Unit {unit.Index+1:D2}] Track finished (Time-based), moving to next.");
                                 unit.VirtualQueue.RemoveAt(0);
                                 await FillVirtualQueueAsync(unit, ct);
                                 unit.TrackStartTime = DateTime.Now;
+                                await ApplyNormalizerFilters(player);
                                 await player.PlayAsync(unit.VirtualQueue[0]);
+                                unit.IsResuming = false;
                             }
-                            else {
+                            else if (!unit.IsResuming) {
+                                _logger.LogInformation($"[Unit {unit.Index+1:D2}] Resuming playback at {DateTime.Now - unit.TrackStartTime}");
+                                unit.IsResuming = true;
+                                await ApplyNormalizerFilters(player);
                                 await player.PlayAsync(unit.VirtualQueue[0]);
                                 await player.SeekAsync(DateTime.Now - unit.TrackStartTime);
                             }
+                        }
+                        else if (isActuallyPlaying) {
+                            unit.IsResuming = false;
                         }
                     }
                 }
@@ -230,10 +542,31 @@ namespace NezumiRadio
             } finally { unit.Lock.Release(); }
         }
 
-        private async Task PrepareTracksOnDemandAsync(BotUnit unit, string targetGenre, CancellationToken ct)
+        private async Task<bool> PrepareTracksOnDemandAsync(BotUnit unit, string targetGenre, CancellationToken ct)
         {
-            if (string.IsNullOrEmpty(unit.LastGenre) || unit.LastGenre != targetGenre || unit.VirtualQueue.Count == 0) {
-                if (unit.LastGenre != targetGenre || string.IsNullOrEmpty(unit.LastGenre)) {
+            bool isNewGenre = string.IsNullOrEmpty(unit.LastGenre) || unit.LastGenre != targetGenre;
+            if (isNewGenre || unit.VirtualQueue.Count == 0) {
+                if (isNewGenre && (unit.VirtualQueue.Count == 0 || !unit.VirtualQueue[0].Title.Contains("jingle", StringComparison.OrdinalIgnoreCase))) {
+                    unit.VirtualQueue.Clear();
+                    _logger.LogInformation($"[Unit {unit.Index+1:D2}] Preparing for new genre: {targetGenre}");
+                    
+                    string? jingleUrl = Environment.GetEnvironmentVariable("JINGLE_URL");
+                    if (!string.IsNullOrEmpty(jingleUrl)) {
+                        try {
+                            _logger.LogInformation($"[Unit {unit.Index+1:D2}] Loading jingle: {jingleUrl}");
+                            var res = await unit.AudioService.Tracks.LoadTracksAsync(jingleUrl, TrackSearchMode.None, cancellationToken: ct);
+                            if (res.Tracks.Length > 0) {
+                                _logger.LogInformation($"[Unit {unit.Index+1:D2}] Jingle added to head of queue.");
+                                unit.VirtualQueue.Insert(0, res.Tracks[0]);
+                            }
+                            else {
+                                _logger.LogWarning($"[Unit {unit.Index+1:D2}] Jingle not found at URL/Path: {jingleUrl}");
+                            }
+                        } catch (Exception ex) { 
+                            _logger.LogError($"[Unit {unit.Index+1:D2}] Jingle load FAILED: {ex.Message}");
+                        }
+                    }
+
                     if (unit.NextUrlPool.Count > 0) {
                         unit.UrlPool = new List<string>(unit.NextUrlPool);
                         unit.NextUrlPool.Clear();
@@ -241,21 +574,12 @@ namespace NezumiRadio
                         var urls = await _audius.GetTracksByGenreAsync(targetGenre);
                         unit.UrlPool = urls.OrderBy(_ => Guid.NewGuid()).ToList();
                     }
-                    unit.VirtualQueue.Clear();
                     
-                    string? jingleUrl = Environment.GetEnvironmentVariable("JINGLE_URL");
-                    if (!string.IsNullOrEmpty(jingleUrl)) {
-                        try {
-                            var res = await unit.AudioService.Tracks.LoadTracksAsync(jingleUrl, TrackSearchMode.None, cancellationToken: ct);
-                            if (res.Tracks.Length > 0) unit.VirtualQueue.Add(res.Tracks[0]);
-                        } catch (Exception ex) {
-                            Console.WriteLine($"[Unit {unit.Index+1:D2}] Jingle Load Exception: {ex.Message}");
-                        }
-                    }
                     await UpdateBotProfile(unit, unit.CurrentGenreKatakana);
                 }
             }
             await FillVirtualQueueAsync(unit, ct);
+            return true;
         }
 
         private async Task FillVirtualQueueAsync(BotUnit unit, CancellationToken ct)
@@ -273,34 +597,58 @@ namespace NezumiRadio
                     var res = await unit.AudioService.Tracks.LoadTracksAsync(url, TrackSearchMode.None, cancellationToken: ct);
                     if (res.Tracks.Length > 0) {
                         var track = res.Tracks[0];
-                        // 5分（300秒）以上の曲はスキップ（ジングルは例外的に許可）
-                        if (track.Duration.TotalSeconds > 0 && track.Duration.TotalSeconds <= 300) {
-                            unit.VirtualQueue.Add(track);
-                        } else {
-                            Console.WriteLine($"[Unit {unit.Index+1:D2}] Skipping long track: {track.Title} ({track.Duration.TotalSeconds}s)");
-                        }
+                        bool isJingle = track.Title.Contains("jingle", StringComparison.OrdinalIgnoreCase);
+                        if (isJingle) { unit.VirtualQueue.Add(track); continue; }
+                        bool isInvalidTitle = string.IsNullOrWhiteSpace(track.Title) || track.Title.Contains("Unknown", StringComparison.OrdinalIgnoreCase) || track.Title.Contains("null", StringComparison.OrdinalIgnoreCase);
+                        bool isInvalidDuration = track.Duration.TotalSeconds <= 0 || track.Duration.TotalSeconds > 300;
+                        if (!isInvalidTitle && !isInvalidDuration) { unit.VirtualQueue.Add(track); }
                     }
                 } catch { }
             }
         }
 
-        private async Task HandlePhysicalConnectionAsync(BotUnit unit, CancellationToken ct)
+        private async Task<bool> HandlePhysicalConnectionAsync(BotUnit unit, CancellationToken ct)
         {
             if (!unit.IsActive || unit.TargetVoiceChannelId == 0) {
                 var p = await GetPlayerAsync(unit);
                 if (p != null) await p.DisconnectAsync(ct);
-                return;
+                return false;
             }
             var guild = unit.Client.GetGuild(ProductionGuildId) ?? unit.Client.GetGuild(TestGuildId) ?? unit.Client.Guilds.FirstOrDefault();
-            if (guild == null) return;
+            if (guild == null) return false;
             var vc = guild.GetVoiceChannel(unit.TargetVoiceChannelId);
-            if (vc == null) return;
+            if (vc == null) return false;
+            
             var player = await GetPlayerAsync(unit);
             if (player == null || player.State == PlayerState.Destroyed || player.VoiceChannelId != unit.TargetVoiceChannelId) {
+                _logger.LogInformation($"[Unit {unit.Index+1:D2}] Joining Voice Channel: {unit.TargetVoiceChannelId}");
                 player = await unit.AudioService.Players.JoinAsync<QueuedLavalinkPlayer, QueuedLavalinkPlayerOptions>(guild.Id, unit.TargetVoiceChannelId, PlayerFactory.Queued, Options.Create(new QueuedLavalinkPlayerOptions { HistoryCapacity = 100 }), cancellationToken: ct);
-                if (player != null) {
-                    await ApplyNormalizerFilters(player);
+                if (player != null) { 
+                    await ApplyNormalizerFilters(player); 
+                    return true;
                 }
+            }
+            return false;
+        }
+
+        public async Task StopAllPlaybackAsync()
+        {
+            if (_isEmergencyStopping) return;
+            _isEmergencyStopping = true;
+            _logger.LogInformation("Genre change detected: Stopping all units and clearing queues.");
+            try {
+                foreach (var u in Units) {
+                    try {
+                        var p = await GetPlayerAsync(u);
+                        if (p != null) {
+                            await p.StopAsync();
+                            u.VirtualQueue.Clear();
+                        }
+                    } catch { }
+                }
+                await Task.Delay(1000);
+            } finally {
+                _isEmergencyStopping = false;
             }
         }
 

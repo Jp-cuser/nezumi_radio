@@ -18,10 +18,10 @@ lavalink:
       http: true # AudiusはHTTP/API経由で動作するため有効にする
       local: true
     bufferDurationMs: 400
-    frameBufferDurationMs: 5000
+    frameBufferDurationMs: 10000
     opusEncodingQuality: 10
     resamplingQuality: LOW
-    trackStuckThresholdMs: 10000
+    trackStuckThresholdMs: 5000
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
     playerUpdateInterval: 5

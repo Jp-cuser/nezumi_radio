@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Reflection;
 using Discord;
 using Discord.Interactions;
 using Discord.WebSocket;
@@ -51,25 +52,38 @@ namespace NezumiRadio
             }
         }
 
-        [SlashCommand("radio_volume", "ユニットの音量を調整します（1〜100）")]
-        public async Task SetVolumeAsync([Summary("bot", "調整するBotを選択してください"), Autocomplete(typeof(UnitAutocompleteHandler))] int unit, [Summary("volume", "音量（1〜100）")] int volume)
+        [SlashCommand("radio_volume", "ユニットの音量を調整します")]
+        public async Task SetVolumeAsync(
+            [Summary("unit", "1-6")] int unit,
+            [Summary("volume", "1-100")] int volume)
         {
-            if (!IsAllowedGuild()) { await RespondAsync("利用不可サーバーです。", ephemeral: true); return; }
+            if (unit < 1 || unit > 6) { await RespondAsync("❌ ユニット番号は1〜6で指定してください。", ephemeral: true); return; }
             var target = _system.Units.FirstOrDefault(u => u.Index == unit - 1);
-            if (target == null) return;
-
-            if (volume < 1) volume = 1;
-            if (volume > 100) volume = 100;
+            if (target == null) { await RespondAsync("❌ 指定されたユニットが見つかりません。", ephemeral: true); return; }
 
             var player = await target.AudioService.Players.GetPlayerAsync(Context.Guild.Id);
             if (player != null) {
-                // dynamicを使用してコンパイル時の型チェックを回避し、実行時にメソッドを呼び出す
-                await ((dynamic)player).SetVolumeAsync(volume / 100f);
+                // 安全なReflectionを使用して音量を設定
+                try {
+                    var method = player.GetType().GetMethod("SetVolumeAsync", BindingFlags.Instance | BindingFlags.Public | BindingFlags.FlattenHierarchy);
+                    if (method != null) {
+                        var result = method.Invoke(player, new object[] { volume / 100f, null! });
+                        if (result is ValueTask vt) await vt;
+                    }
+                } catch { }
                 await RespondAsync($"✅ ユニット {unit:D2} の音量を {volume}% に設定しました。");
             }
             else {
                 await RespondAsync("❌ ユニットがVCに参加していません。", ephemeral: true);
             }
+        }
+
+        [SlashCommand("radio_sync", "全ユニットの再生を強制停止して再同期（ジャンル切り替え）します")]
+        public async Task SyncAllAsync()
+        {
+            await DeferAsync();
+            await _system.StopAllPlaybackAsync();
+            await FollowupAsync("✅ 全ユニットの再生を停止し、再同期のリクエストを送信しました。順次ジングルから再生が再開されます。");
         }
     }
 
